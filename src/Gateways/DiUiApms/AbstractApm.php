@@ -5,7 +5,7 @@ namespace GlobalPayments\WooCommercePaymentGatewayProvider\Gateways\DiUiApms;
 use Automattic\WooCommerce\Internal\DependencyManagement\ContainerException;
 use Exception;
 use Automattic\WooCommerce\Caching\CacheException;
-use GlobalPayments\Api\Entities\Enums\ShaHashType;
+use GlobalPayments\Api\Utils\GenerationUtils;
 use GlobalPayments\WooCommercePaymentGatewayProvider\Gateways\GpApiGateway;
 use GlobalPayments\WooCommercePaymentGatewayProvider\Utils\Utils;
 use WC_Order;
@@ -30,48 +30,31 @@ class AbstractApm {
 	 * @throws CacheException
 	 */
 	public static function handle_gpapi_apm_status_notification(): void {
-		if ( ! self::validateRequestContents( new GpApiGateway() ) ) {
+		// validate_request_contents() returns the signature-verified data
+		// set, or false when the request cannot be trusted.
+		$request_data = self::validate_request_contents( new GpApiGateway() );
+		if ( false === $request_data ) {
 			return;
 		}
 
-		// Get request data (could be GET or POST)
-		$request_data = array_merge( $_GET, $_POST );
-
-		// Parse JSON body if present
-		$raw_input = file_get_contents( 'php://input' );
-		if ( ! empty( $raw_input ) ) {
-			$json_data = json_decode( $raw_input, true );
-			if ( $json_data ) {
-				$request_data = array_merge( $request_data, $json_data );
-			}
-		}
-
-		// Extract transaction details
 		$transaction_id = self::extract_transaction_id( $request_data );
 		$payment_status = self::extract_payment_status( $request_data );
 
 		if ( ! empty( $request_data['reference'] ) ) {
 			$order_id = str_replace( 'WooCommerce_Order_', '', $request_data['reference'] );
 
-			// Find the order
 			$order = wc_get_order( $order_id );
 
-			// If status notification transaction id and order transaction id are the same then update the order status
-			if ( $order->get_transaction_id() === $transaction_id ) {
+			if ( ! $order ) {
+				return;
+			}
+
+			// Only mutate the order when the notification carries a non-empty transaction
+			// id that matches the one currently stored on the order. A callback whose
+			// transaction id does not match the order's active attempt (for example, a
+			// delayed callback from a previous, retried attempt) must not change its state.
+			if ( ! empty( $transaction_id ) && $order->get_transaction_id() === $transaction_id ) {
 				self::update_order_status_from_notification( $order, $payment_status, $transaction_id, $request_data );
-			} else {
-				// Fallback: If the order is still awaiting payment, reflect the reported outcome.
-				$status_upper = strtoupper( $payment_status );
-				if ( in_array( $status_upper, array( 'DECLINED', 'CANCELLED' ) ) && $order->get_status() === 'on-hold' ) {
-					$new_status = 'DECLINED' === $status_upper ? 'failed' : 'cancelled';
-					$note_text  = sprintf(
-						'Order status updated to %s due to payment status: %s (fallback).',
-						$new_status,
-						$status_upper
-					);
-					$order->update_status( $new_status, $note_text );
-					$order->save();
-				}
 			}
 		}
 	}
@@ -88,8 +71,8 @@ class AbstractApm {
 		$possible_fields = array( 'id', 'reference', 'notification' );
 
 		foreach ( $possible_fields as $field ) {
-			if ( isset( $data[ $field ] ) && ! empty( $data[ $field ] ) ) {
-				return sanitize_text_field( $data[ $field ] );
+			if ( isset( $data[ $field ] ) && is_scalar( $data[ $field ] ) && '' !== (string) $data[ $field ] ) {
+				return sanitize_text_field( (string) $data[ $field ] );
 			}
 		}
 
@@ -108,8 +91,8 @@ class AbstractApm {
 		$possible_fields = array( 'status' );
 
 		foreach ( $possible_fields as $field ) {
-			if ( isset( $data[ $field ] ) && ! empty( $data[ $field ] ) ) {
-				return sanitize_text_field( $data[ $field ] );
+			if ( isset( $data[ $field ] ) && is_scalar( $data[ $field ] ) && '' !== (string) $data[ $field ] ) {
+				return sanitize_text_field( (string) $data[ $field ] );
 			}
 		}
 
@@ -195,30 +178,44 @@ class AbstractApm {
 	public static function handle_gpapi_apm_success_redirect(): void {
 		$gateway = new GpApiGateway();
 
-		if ( ! self::validateRequestContents( $gateway ) ) {
+		$request_data = self::validate_request_contents( $gateway );
+		if ( false === $request_data ) {
 			return;
 		}
 
-		if ( isset( $_REQUEST['status'] ) && in_array( strtoupper( $_REQUEST['status'] ), array( 'DECLINED', 'CANCELLED' ) ) ) {
-			$status_upper = strtoupper( $_REQUEST['status'] );
-			
-			$order        = wc_get_order(
-				str_replace( 'WooCommerce_Order_', '', $_REQUEST['reference'] )
+		$transaction_id = self::extract_transaction_id( $request_data );
+		$status         = isset( $request_data['status'] ) && is_scalar( $request_data['status'] )
+			? strtoupper( (string) $request_data['status'] )
+			: '';
+		$reference      = isset( $request_data['reference'] ) && is_scalar( $request_data['reference'] )
+			? (string) $request_data['reference']
+			: '';
+
+		if ( '' !== $reference && in_array( $status, array( 'DECLINED', 'CANCELLED' ), true ) ) {
+			$order = wc_get_order(
+				str_replace( 'WooCommerce_Order_', '', $reference )
 			);
 
-			$new_status = 'DECLINED' === $status_upper ? 'failed' : 'cancelled';
-			$note_text  = 'DECLINED' === $status_upper
+			$new_status = 'DECLINED' === $status ? 'failed' : 'cancelled';
+			$note_text  = 'DECLINED' === $status
 				? 'Payment was declined.'
 				: 'Payment was cancelled by customer.';
 
-			if ( $order && in_array( $order->get_status(), array( 'on-hold', 'pending' ), true ) ) {
+			// Only transition the order when the callback matches the currently stored
+			// transaction. A delayed callback from a previous, retried attempt must not
+			// fail or cancel the active attempt.
+			$matches_active_attempt = $order
+				&& ! empty( $transaction_id )
+				&& $order->get_transaction_id() === $transaction_id;
+
+			if ( $matches_active_attempt && in_array( $order->get_status(), array( 'on-hold', 'pending' ), true ) ) {
 				$order->update_status( $new_status, $note_text );
-			} elseif ( $order ) {
+			} elseif ( $matches_active_attempt ) {
 				$order->add_order_note( $note_text );
 			}
-			
+
 			wp_safe_redirect( wc_get_checkout_url() );
-		} elseif ( isset( $_REQUEST['status'] ) && $_REQUEST['status'] === 'CAPTURED' ) {
+		} elseif ( '' !== $reference && 'CAPTURED' === $status ) {
 			self::handle_gpapi_apm_status_notification();
 
 			WC()->cart->empty_cart();
@@ -226,7 +223,7 @@ class AbstractApm {
 			wp_safe_redirect(
 				$gateway->get_return_url(
 					wc_get_order(
-						str_replace( 'WooCommerce_Order_', '', $_REQUEST['reference'] )
+						str_replace( 'WooCommerce_Order_', '', $reference )
 					)
 				)
 			);
@@ -239,51 +236,87 @@ class AbstractApm {
 
 	/**
 	 *
-	 * Validate that querry string hasn't been tamperred with. This requires us to take the querry string
-	 * minus the signature at the beginning, concatenating the merchant's app key to the end of that, and
-	 * calculating the SHA512 hash. That string should equal the request signature at the beginning of the
-	 * querry string.
+	 * Validate that the request carries a genuine gateway signature and return the
+	 * data set that callers are allowed to act upon.
 	 *
-	 * @param GpApiGateway $gateway
-	 * @return bool
+	 * @param GpApiGateway $gateway The gateway instance used to resolve the merchant credentials.
+	 * @return array|false The request data on success, or false on failure.
 	 */
-	private static function validateRequestContents( GpApiGateway $gateway ): bool {
-		$queryStringSubString = '';
+	private static function validate_request_contents( GpApiGateway $gateway ): false|array {
+		$app_key = $gateway->get_backend_gateway_options()['appKey'] ?? '';
+		$app_key = is_scalar( $app_key ) ? (string) $app_key : '';
 
-		if ( isset( $_SERVER['QUERY_STRING'] ) && ! empty( trim( $_SERVER['QUERY_STRING'] ) ) ) {
-			$queryStringSubString = $_SERVER['QUERY_STRING'];
+		// Never validate against an empty app key
+		if ( '' === $app_key ) {
+			return false;
 		}
 
-		if ( strpos( $queryStringSubString, '&id=' ) !== false ) {
-			$queryStringSubString = substr( $queryStringSubString, strpos( $queryStringSubString, '&id=' ) + 1 );
+		$signature = self::get_request_signature();
+		if ( '' === $signature ) {
+			return false;
 		}
 
-		if ( '' === $queryStringSubString ) {
-			$raw_input = file_get_contents( 'php://input' );
-			if ( ! empty( $raw_input ) ) {
-				$queryStringSubString = json_encode( json_decode( $raw_input, true ) );
+		$request_method = isset( $_SERVER['REQUEST_METHOD'] ) ? strtoupper( sanitize_text_field( wp_unslash( $_SERVER['REQUEST_METHOD'] ) ) ) : 'GET';
+		$raw_input      = (string) file_get_contents( 'php://input' );
+
+		// Build the data set the handlers are allowed to act upon. For POST status
+		// notifications this is the JSON (or form-encoded) body; for GET redirects it is
+		// the query parameters. On POST the query parameters are merged in as well so the
+		// WooCommerce API route (wc-api) remains resolvable.
+		if ( 'POST' === $request_method ) {
+			$data = json_decode( $raw_input, true );
+			if ( ! is_array( $data ) ) {
+				$data = array();
+				parse_str( $raw_input, $data );
 			}
-		}
-
-		$signature = '';
-		if ( ! empty( $_REQUEST['X-GP-Signature'] ) ) {
-			$signature = (string) $_REQUEST['X-GP-Signature'];
+			// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Authenticity is verified via the X-GP-Signature, not a WordPress nonce.
+			$query_params = wp_unslash( $_GET );
+			unset( $query_params['X-GP-Signature'] );
+			$data = array_merge( $query_params, $data );
 		} else {
-			$headers   = array_change_key_case( Utils::get_all_headers() );
-			$signature = ( ! empty( $headers['x-gp-signature'] ) ) ? $headers['x-gp-signature'] : '';
-
-			// Final attempt to get the signature
-			if ( '' === $signature && isset( $_SERVER['HTTP_X_GP_SIGNATURE'] ) &&
-			! empty( $_SERVER['HTTP_X_GP_SIGNATURE'] ) ) {
-				$signature = (string) $_SERVER['HTTP_X_GP_SIGNATURE'];
-			}
+			// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Authenticity is verified via the X-GP-Signature, not a WordPress nonce.
+			$data = wp_unslash( $_GET );
+			unset( $data['X-GP-Signature'] );
 		}
 
-		$expectedSignature = hash(
-			'sha512',
-			$queryStringSubString . $gateway->get_backend_gateway_options()['appKey']
-		);
+		// The value feeds the HMAC only; it is never output, stored, or used in a query.
+		// phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized, WordPress.Security.ValidatedSanitizedInput.MissingUnslash -- Raw signed bytes, HMAC input only; sanitizing/unslashing would corrupt the signature check.
+		$query_string = isset( $_SERVER['QUERY_STRING'] ) ? (string) $_SERVER['QUERY_STRING'] : '';
+		if ( '' !== trim( $query_string ) ) {
+			$to_hash = ltrim( (string) preg_replace( '/(^|&)X-GP-Signature=[^&]*/', '', $query_string ), '&' );
+		} else {
+			$to_hash = $raw_input;
+		}
 
-		return hash_equals( $expectedSignature, $signature );
+		$expected_signature = GenerationUtils::generateXGPSignature( $to_hash, $app_key );
+
+		if ( ! hash_equals( $expected_signature, $signature ) ) {
+			return false;
+		}
+
+		return $data;
+	}
+
+	/**
+	 * Retrieve the X-GP-Signature from the request (query parameter or header).
+	 *
+	 * @return string
+	 */
+	private static function get_request_signature(): string {
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Authenticity is verified via the X-GP-Signature, not a WordPress nonce.
+		$query_signature = isset( $_GET['X-GP-Signature'] ) ? sanitize_text_field( wp_unslash( $_GET['X-GP-Signature'] ) ) : '';
+		if ( '' !== $query_signature ) {
+			return $query_signature;
+		}
+
+		$headers   = array_change_key_case( Utils::get_all_headers() );
+		$signature = ( ! empty( $headers['x-gp-signature'] ) ) ? (string) $headers['x-gp-signature'] : '';
+
+		// Final attempt to get the signature.
+		if ( '' === $signature && ! empty( $_SERVER['HTTP_X_GP_SIGNATURE'] ) ) {
+			$signature = sanitize_text_field( wp_unslash( $_SERVER['HTTP_X_GP_SIGNATURE'] ) );
+		}
+
+		return $signature;
 	}
 }

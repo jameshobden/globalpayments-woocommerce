@@ -437,19 +437,19 @@ msgstr "Połącz się z bramką Unified Payments"
 
 #: src/Gateways/GpApiGateway.php:306
 msgid "Live App Id*"
-msgstr "App ID En ligne*"
+msgstr "ID aplikacji produkcyjnej*"
 
 #: src/Gateways/GpApiGateway.php:314
 msgid "Live App Key*"
-msgstr "App Key En ligne*"
+msgstr "Klucz aplikacji produkcyjnej*"
 
 #: src/Gateways/GpApiGateway.php:344
 msgid "Sandbox App Id*"
-msgstr "App ID Test*"
+msgstr "ID aplikacji testowej*"
 
 #: src/Gateways/GpApiGateway.php:353
 msgid "Sandbox App Key*"
-msgstr "App Key Test*"
+msgstr "Klucz aplikacji testowej*"
 
 #: src/Gateways/GpApiGateway.php:322
 #: src/Gateways/GpApiGateway.php:323
